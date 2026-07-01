@@ -82,6 +82,8 @@ module.exports = async function handler(req, res) {
     if (!match) throw new Error('No JSON in Anthropic response');
 
     const { fibres = {}, queries = [] } = JSON.parse(match[0]);
+    console.log('Claude queries:', queries);
+console.log('Claude fibres:', fibres);
     const analysis = analyzeResult(fibres);
 
     // Step 2: Serper shopping search for each query
