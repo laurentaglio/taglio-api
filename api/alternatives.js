@@ -26,35 +26,20 @@ function analyzeResult(fibres) {
   return { naturalPct, syntheticPct, passes };
 }
 
-const SITES = [
-  'faithfullthebrand.com',
-  'thereformation.com',
-  'everlane.com',
-  'christydawn.com',
-  'sezane.com',
-  'quince.com',
-  'jennikayne.com',
-  'rouje.com',
-  'coucouintimates.com',
-].map(s => `site:${s}`).join(' OR ');
-
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
-
-  if (req.method === 'GET') {
-    return res.status(200).json({ status: 'Taglio API is live' });
-  }
-
+  if (req.method === 'GET') return res.status(200).json({ status: 'Taglio API is live' });
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { imageUrl, materials, category, price, language } = req.body || {};
   if (!materials) return res.status(400).json({ error: 'materials is required' });
 
   try {
+    // Step 1: Claude extracts fibres and generates search queries
     const contentBlocks = [];
     if (imageUrl) {
       contentBlocks.push({ type: 'image', source: { type: 'url', url: imageUrl } });
@@ -66,7 +51,7 @@ module.exports = async function handler(req, res) {
         `Materials text (may be in any language): ${materials}\n` +
         `Category: ${category || 'clothing'}\n\n` +
         `1. Extract the fabric composition as fibre names in English mapped to integer percentages.\n` +
-        `2. Generate 3 short search queries (under 5 words each) to find visually similar natural-fibre alternatives.\n\n` +
+        `2. Generate 3 short search queries (under 5 words each) to find visually similar natural-fibre alternatives to buy online.\n\n` +
         `Respond ONLY in this exact JSON format, no other text:\n` +
         `{\n` +
         `  "fibres": { "polyester": 95, "spandex": 5 },\n` +
@@ -98,33 +83,37 @@ module.exports = async function handler(req, res) {
     const { fibres = {}, queries = [] } = JSON.parse(match[0]);
     const analysis = analyzeResult(fibres);
 
+    // Step 2: Serper shopping search for each query
     const alternatives = [];
     for (const query of queries.slice(0, 3)) {
       if (alternatives.length >= 3) break;
-      const searchUrl =
-        `https://www.googleapis.com/customsearch/v1` +
-        `?key=${process.env.GOOGLE_API_KEY}` +
-        `&cx=${process.env.GOOGLE_SEARCH_ENGINE_ID}` +
-        `&q=${encodeURIComponent(query + ' ' + SITES)}` +
-        `&num=3`;
       try {
-        const searchRes = await fetch(searchUrl);
-        const searchData = await searchRes.json();
-        console.log('Google search for:', query, '| results:', searchData.items?.length || 0);
-        if (searchData.items) {
-          for (const item of searchData.items) {
+        const serperRes = await fetch('https://google.serper.dev/shopping', {
+          method: 'POST',
+          headers: {
+            'X-API-KEY': process.env.SERPER_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ q: query, num: 3 }),
+        });
+
+        const serperData = await serperRes.json();
+        console.log('Serper results for:', query, '| count:', serperData.shopping?.length || 0);
+
+        if (serperData.shopping) {
+          for (const item of serperData.shopping) {
             if (alternatives.length >= 3) break;
             alternatives.push({
-              brand: new URL(item.link).hostname.replace('www.', '').split('.')[0],
-              product: item.title.split('|')[0].split('-')[0].trim(),
-              url: item.link,
-              image: item.pagemap?.cse_image?.[0]?.src || null,
-              price: '',
+              brand: item.source || '',
+              product: item.title || '',
+              url: item.link || '',
+              image: item.imageUrl || null,
+              price: item.price || '',
             });
           }
         }
       } catch (err) {
-        console.error('Google search error for query:', query, err);
+        console.error('Serper search error for query:', query, err);
       }
     }
 
