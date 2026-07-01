@@ -49,9 +49,10 @@ module.exports = async function handler(req, res) {
       text:
         `You are a fashion assistant. Analyse this product.\n` +
         `Materials text (may be in any language): ${materials}\n` +
-        `Category: ${category || 'clothing'}\n\n` +
+        `Category: ${category || 'clothing'}\n` +
+        `Price: ${price || 'unknown'}\n\n` +
         `1. Extract the fabric composition as fibre names in English mapped to integer percentages.\n` +
-        `2. Generate 3 short search queries (under 5 words each) to find visually similar natural-fibre alternatives to buy online.\n\n` +
+        `2. Generate 3 shopping search queries IN ENGLISH to find visually similar natural-fibre clothing alternatives to buy online. Always write queries in English regardless of the product page language. Each query MUST include the natural fibre material (cotton/linen/wool/silk/cashmere/leather) + the garment type + optionally color. Keep each query under 6 words. Match the price range: ${price || 'mid-range'}.\n\n` +
         `Respond ONLY in this exact JSON format, no other text:\n` +
         `{\n` +
         `  "fibres": { "polyester": 95, "spandex": 5 },\n` +
