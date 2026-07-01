@@ -26,6 +26,18 @@ function analyzeResult(fibres) {
   return { naturalPct, syntheticPct, passes };
 }
 
+const SITES = [
+  'faithfullthebrand.com',
+  'thereformation.com',
+  'everlane.com',
+  'christydawn.com',
+  'sezane.com',
+  'quince.com',
+  'jennikayne.com',
+  'rouje.com',
+  'coucouintimates.com',
+].map(s => `site:${s}`).join(' OR ');
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -93,11 +105,12 @@ module.exports = async function handler(req, res) {
         `https://www.googleapis.com/customsearch/v1` +
         `?key=${process.env.GOOGLE_API_KEY}` +
         `&cx=${process.env.GOOGLE_SEARCH_ENGINE_ID}` +
-        `&q=${encodeURIComponent(query)}` +
+        `&q=${encodeURIComponent(query + ' ' + SITES)}` +
         `&num=3`;
       try {
         const searchRes = await fetch(searchUrl);
         const searchData = await searchRes.json();
+        console.log('Google search for:', query, '| results:', searchData.items?.length || 0);
         if (searchData.items) {
           for (const item of searchData.items) {
             if (alternatives.length >= 3) break;
