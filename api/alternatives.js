@@ -258,12 +258,7 @@ const TIER_DEFS = [
 const HARD_MIN_FACTOR = 0.30;
 const HARD_MAX_FACTOR = 2.50;
 
-// ── Search fallback ───────────────────────────────────────────────────────────
-
-// Below this many catalogue results, we supplement with live search. Set to 2
-// rather than 0 so a single lonely catalogue match still gets company — a
-// popup showing one option looks broken even when that option is good.
-const MIN_CATALOGUE_RESULTS = 2;
+// ── Search lane ───────────────────────────────────────────────────────────────
 
 // Calls the sibling api/search.js endpoint. Kept as an HTTP call rather than a
 // direct import so the two lanes stay independently deployable and one failing
@@ -328,84 +323,82 @@ module.exports = async function handler(req, res) {
     const hardMin = priceBaseUsd * HARD_MIN_FACTOR;
     const hardMax = priceBaseUsd * HARD_MAX_FACTOR;
 
-    // Step 4: Query each tier (category + price range filter, ranked by recency)
-    const tiers        = {};
-    const allAlts      = [];
+    // Step 4: Query the catalogue and the live search lane IN PARALLEL.
+    //
+    // Both always run — search isn't gated behind the catalogue coming up short.
+    // Two reasons: (1) the catalogue skews toward larger retailers with feeds,
+    // so indie discovery would be suppressed exactly when the catalogue is
+    // healthiest; (2) running search on every scan is what populates staging,
+    // which is how the catalogue grows at all. Gating it would mean the
+    // catalogue only ever fills in areas where it's already weak.
+    //
+    // Catalogue results are still PREFERRED in the output ordering — they have
+    // verified fibre content and known affiliate relationships. Search results
+    // follow, clearly marked as unverified discoveries.
+    const tiers   = {};
+    const allAlts = [];
 
-    for (const tier of TIER_DEFS) {
-      const minUsd = Math.max(priceBaseUsd * tier.minFactor, hardMin);
-      const maxUsd = Math.min(priceBaseUsd * tier.maxFactor, hardMax);
-      if (minUsd >= maxUsd) continue;
+    const catalogueWork = (async () => {
+      for (const tier of TIER_DEFS) {
+        const minUsd = Math.max(priceBaseUsd * tier.minFactor, hardMin);
+        const maxUsd = Math.min(priceBaseUsd * tier.maxFactor, hardMax);
+        if (minUsd >= maxUsd) continue;
 
-      const rows = await queryTier(normCategory, minUsd, maxUsd);
-      if (rows.length === 0) continue;
+        const rows = await queryTier(normCategory, minUsd, maxUsd);
+        if (rows.length === 0) continue;
 
-      // Score each candidate against the source item's visual attributes, then
-      // rank best-match first. Falls back to created_at order (already applied
-      // by queryTier) when scores tie or attributes are missing.
-      const scored = rows
-        .map(p => ({
-          row: p,
-          score: scoreAttributeMatch(
-            sourceAttrs,
-            embellishments,
-            { pattern: p.pattern, silhouette: p.silhouette, color_family: p.color_family },
-            p.embellishments
-          ),
-        }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, RESULTS_PER_TIER);
+        const scored = rows
+          .map(p => ({
+            row: p,
+            score: scoreAttributeMatch(
+              sourceAttrs,
+              embellishments,
+              { pattern: p.pattern, silhouette: p.silhouette, color_family: p.color_family },
+              p.embellishments
+            ),
+          }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, RESULTS_PER_TIER);
 
-      const alts = scored.map(({ row: p, score }) => ({
-        brand:    p.brand,
-        product:  p.name,
-        url:      p.url,
-        image:    p.image_url || null,
-        price:    formatPrice(p.price_original, p.currency_original),
-        price_base: p.price_base,
-        tier:     tier.name,
-        material: formatFibreComposition(p.fibre_composition),
-        match_score: score,
-      }));
+        const alts = scored.map(({ row: p, score }) => ({
+          brand:       p.brand,
+          product:     p.name,
+          url:         p.url,
+          image:       p.image_url || null,
+          price:       formatPrice(p.price_original, p.currency_original),
+          price_base:  p.price_base,
+          tier:        tier.name,
+          material:    formatFibreComposition(p.fibre_composition),
+          match_score: score,
+          source:      'catalogue',
+          verified:    true,
+        }));
 
-      tiers[tier.name] = { label: tier.label, alternatives: alts };
-      allAlts.push(...alts);
-    }
-
-    // Step 5: If the curated catalogue came up short, fall through to the live
-    // search lane. The catalogue is preferred when it has good matches (verified
-    // fibre content, known affiliate relationship, fast), but an empty result is
-    // worse than an unverified discovery — especially early on while the
-    // catalogue is still small and skews toward larger retailers.
-    if (allAlts.length < MIN_CATALOGUE_RESULTS) {
-      try {
-        const searchAlts = await runSearchFallback({
-          imageUrl,
-          category:   normCategory,
-          attributes: sourceAttrs,
-          fibres,
-        });
-
-        if (searchAlts.length > 0) {
-          // Catalogue results first (verified, monetizable), discoveries after
-          const merged = [...allAlts, ...searchAlts];
-          return res.status(200).json({
-            fibres,
-            liningFibres,
-            embellishments,
-            ...analysis,
-            input_price_base: priceBaseUsd,
-            tiers,
-            alternatives: merged,
-            source: allAlts.length > 0 ? 'mixed' : 'search',
-          });
-        }
-      } catch (searchErr) {
-        // Search failing shouldn't break the response — fall through to
-        // whatever the catalogue produced, even if that's nothing.
-        console.error('search fallback failed:', searchErr);
+        tiers[tier.name] = { label: tier.label, alternatives: alts };
+        allAlts.push(...alts);
       }
-    }
+    })();
+
+    const searchWork = runSearchFallback({
+      imageUrl,
+      category:   normCategory,
+      attributes: sourceAttrs,
+      fibres,
+    }).catch(searchErr => {
+      // Search failing must never break the response — the catalogue result
+      // (even an empty one) is still worth returning.
+      console.error('search lane failed:', searchErr);
+      return [];
+    });
+
+    const [, searchAlts] = await Promise.all([catalogueWork, searchWork]);
+
+    // Verified catalogue matches first, discoveries after
+    const merged = [...allAlts, ...searchAlts];
+
+    let source = 'catalogue';
+    if (allAlts.length > 0 && searchAlts.length > 0) source = 'mixed';
+    else if (allAlts.length === 0) source = 'search';
 
     return res.status(200).json({
       fibres,
@@ -414,8 +407,8 @@ module.exports = async function handler(req, res) {
       ...analysis,
       input_price_base: priceBaseUsd,
       tiers,
-      alternatives: allAlts,
-      source: 'catalogue',
+      alternatives: merged,
+      source,
     });
   } catch (err) {
     console.error('alternatives handler error:', err);
