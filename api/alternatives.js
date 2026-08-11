@@ -179,7 +179,12 @@ async function parseFibresAndAttributes(imageUrl, materials, category, language)
       `image — e.g. embroidery, beading, sequins, buttons, lace trim, appliqué. Use ONLY these controlled values: ` +
       `${JSON.stringify(EMBELLISHMENT_VALUES)}. Return an empty array [] if the shell is plain with no embellishment. ` +
       `Include a value only if it's clearly visible — don't guess from category alone.\n` +
-      `4. Visual attributes read directly from the product image. Use ONLY these controlled values ` +
+      `4. search_query: a short natural search phrase (5-9 words) describing this ` +
+      `garment as a shopper would search for it — gender, colour, fabric, garment type, ` +
+      `and one or two distinguishing details. Examples: "womens tan linen midi dress ` +
+      `square neck", "mens navy wool crewneck sweater". Describe the garment ITSELF, ` +
+      `not a list of keywords, and do not include brand names or the word "buy".\n` +
+      `5. Visual attributes read directly from the product image. Use ONLY these controlled values ` +
       `(pick the single closest match, use "other" only if truly none fit):\n` +
       `   - pattern: one of ${JSON.stringify(PATTERN_VALUES)}\n` +
       `   - silhouette: one of ${JSON.stringify(SILHOUETTE_VALUES)}\n` +
@@ -188,6 +193,7 @@ async function parseFibresAndAttributes(imageUrl, materials, category, language)
       `Respond ONLY in this exact JSON format, no other text:\n` +
       `{ "shell_fibres": { "polyester": 95, "elastane": 5 }, "lining_fibres": { "polyester": 100 }, ` +
       `"embellishments": ["embroidery", "buttons"], ` +
+      `"search_query": "womens tan linen midi dress square neck", ` +
       `"attributes": { "pattern": "floral", "silhouette": "a_line", "color_family": "multicolor" } }`,
   });
 
@@ -217,6 +223,7 @@ async function parseFibresAndAttributes(imageUrl, materials, category, language)
     fibres:        parsed.shell_fibres || {},
     liningFibres:  parsed.lining_fibres || {},
     embellishments: Array.isArray(parsed.embellishments) ? parsed.embellishments : [],
+    searchQuery:   typeof parsed.search_query === 'string' ? parsed.search_query : null,
     attributes:    parsed.attributes || { pattern: null, silhouette: null, color_family: null },
   };
 }
@@ -263,7 +270,7 @@ const HARD_MAX_FACTOR = 2.50;
 // Calls the sibling api/search.js endpoint. Kept as an HTTP call rather than a
 // direct import so the two lanes stay independently deployable and one failing
 // can't take the other down.
-async function runSearchFallback({ imageUrl, category, attributes, fibres }) {
+async function runSearchFallback({ imageUrl, category, attributes, fibres, searchQuery }) {
   const base = process.env.SEARCH_API_BASE || 'https://taglio-api.vercel.app';
 
   // Pass the dominant natural fibre (if the source item has one) so the search
@@ -276,7 +283,7 @@ async function runSearchFallback({ imageUrl, category, attributes, fibres }) {
   const res = await fetch(`${base}/api/search`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ imageUrl, category, attributes, fibre: dominantNatural }),
+    body:    JSON.stringify({ imageUrl, category, attributes, fibre: dominantNatural, searchQuery }),
   });
 
   if (!res.ok) throw new Error(`search endpoint returned ${res.status}`);
@@ -296,7 +303,7 @@ module.exports = async function handler(req, res) {
 
   try {
     // Step 1: Extract fibre composition + visual attributes via Claude
-    const { fibres, liningFibres, embellishments, attributes: sourceAttrs } =
+    const { fibres, liningFibres, embellishments, searchQuery, attributes: sourceAttrs } =
       await parseFibresAndAttributes(imageUrl, materials, category, language);
     const analysis = analyzeResult(fibres);
 
@@ -384,6 +391,7 @@ module.exports = async function handler(req, res) {
       category:   normCategory,
       attributes: sourceAttrs,
       fibres,
+      searchQuery,
     }).catch(searchErr => {
       // Search failing must never break the response — the catalogue result
       // (even an empty one) is still worth returning.
