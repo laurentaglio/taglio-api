@@ -116,15 +116,30 @@ async function runSearch(query, numResults = 20) {
   const data = await res.json();
   const items = data.shopping || data.organic || [];
 
-  return items
+  // The /shopping endpoint's response shape was assumed, not verified — if
+  // `items` is empty but the response has other top-level keys, that mismatch
+  // is the bug. Logging keys rather than the full body to keep logs readable.
+  if (items.length === 0) {
+    console.log('[search] serper returned no items; response keys:', Object.keys(data));
+  }
+
+  const mapped = items
     .map(item => ({
       title:  item.title || '',
       url:    item.link || '',
       image:  item.imageUrl || item.thumbnail || null,
       price:  item.price || null,
       source: item.source || domainOf(item.link || ''),
-    }))
-    .filter(r => r.url && !isExcluded(r.url));
+    }));
+
+  const kept = mapped.filter(r => r.url && !isExcluded(r.url));
+
+  if (mapped.length > 0 && kept.length === 0) {
+    console.log('[search] all results excluded by domain filter; domains were:',
+      mapped.map(r => domainOf(r.url)).slice(0, 10));
+  }
+
+  return kept;
 }
 
 // ── Claude verification ────────────────────────────────────────────────────────
@@ -384,12 +399,33 @@ module.exports = async function handler(req, res) {
       return true;
     }).slice(0, 24);   // cap what we send to Claude, for cost and latency
 
+    // Diagnostics: these three numbers tell you exactly which stage is dropping
+    // candidates. Remove once the thresholds are tuned.
+    console.log('[search] queries:', { affiliateQuery, indieQuery });
+    console.log('[search] raw results:', {
+      affiliate: affiliateRaw.length,
+      indie:     indieRaw.length,
+      deduped:   candidates.length,
+    });
+
     if (candidates.length === 0) {
+      console.log('[search] no candidates survived domain filtering');
       return res.status(200).json({ alternatives: [], source: 'search' });
     }
 
     const verified     = await verifyCandidates(imageUrl, sourceAttrs, candidates);
     const alternatives = compose(verified);
+
+    console.log('[search] verification:', {
+      verified:      verified.length,
+      naturalFibre:  verified.filter(r => r.natural_fibre_likely).length,
+      passedVisual:  verified.filter(r => r.visual_match >= MIN_VISUAL_MATCH).length,
+      passedBoth:    verified.filter(r => r.natural_fibre_likely && r.visual_match >= MIN_VISUAL_MATCH).length,
+      shown:         alternatives.length,
+      scoreSample:   verified.slice(0, 5).map(r => ({
+        t: r.title?.slice(0, 40), nat: r.natural_fibre_likely, vis: r.visual_match,
+      })),
+    });
 
     // Capture everything that passed the fibre-plausibility check into staging,
     // not just what we're showing. A result can be a poor visual match for THIS
