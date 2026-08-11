@@ -78,27 +78,74 @@ const NATURAL_FIBRE_TERMS = ['linen', 'cotton', 'wool', 'silk', 'cashmere', 'hem
  * "made in", "small batch"). We can't hard-filter to indie domains in the
  * query itself, so filtering happens on the results — the query just biases.
  */
-function buildQuery({ category, fibre, colorFamily, silhouette, lane }) {
+/*
+ * Builds a search query for a given lane.
+ *
+ * Prefers `searchQuery` — a natural garment description Claude wrote from the
+ * product image ("womens tan linen midi dress square neck"). That works far
+ * better than concatenated attributes: keyword soup like
+ * "linen OR cotton OR wool blue fitted knit buy" returns category pages and
+ * blog posts, because that's what generic keyword queries match.
+ *
+ * The attribute-built fallback only applies when Claude couldn't produce a
+ * description (e.g. no product image available).
+ */
+function buildQuery({ category, fibre, colorFamily, silhouette, lane, searchQuery }) {
   const parts = [];
 
-  if (fibre) parts.push(`${fibre}`);
-  else parts.push(NATURAL_FIBRE_TERMS.slice(0, 3).join(' OR '));
-
-  if (colorFamily && colorFamily !== 'multicolor') parts.push(colorFamily);
-  if (silhouette && silhouette !== 'other') parts.push(silhouette.replace(/_/g, ' '));
-  parts.push(category || 'clothing');
-
-  // Web search (unlike shopping search) will happily return blog posts and
-  // listicles, so we need shopping intent in the query itself to bias toward
-  // actual product pages.
-  parts.push('buy');
+  if (searchQuery) {
+    parts.push(searchQuery);
+  } else {
+    if (fibre) parts.push(fibre);
+    else parts.push(NATURAL_FIBRE_TERMS.slice(0, 3).join(' '));
+    if (colorFamily && colorFamily !== 'multicolor') parts.push(colorFamily);
+    if (silhouette && silhouette !== 'other') parts.push(silhouette.replace(/_/g, ' '));
+    parts.push(category || 'clothing');
+  }
 
   if (lane === 'indie') {
     // Nudges away from the big chains that dominate generic apparel queries
-    parts.push('small brand');
+    parts.push('independent label');
+  } else {
+    parts.push('shop');
   }
 
   return parts.join(' ');
+}
+
+// ── Product page detection ─────────────────────────────────────────────────────
+
+/*
+ * Web search returns category pages ("Women's Sweaters & Cardigans"), blog
+ * posts ("12 Things I Wish I Knew Before Knitting"), and lookbooks alongside
+ * actual products. None of those are usable as alternatives — you can't link a
+ * shopper to a category page and call it a match.
+ *
+ * This is a cheap pre-filter on URL shape and title; Claude does the more
+ * reliable judgement in the verification pass.
+ */
+const NON_PRODUCT_URL_PATTERNS = [
+  '/blog/', '/journal/', '/magazine/', '/stories/', '/guide',
+  '/collections/all', '/category/', '/categories/', '/c/',
+  '/search', '/help', '/about', '/lookbook', '/edit/',
+];
+
+const NON_PRODUCT_TITLE_PATTERNS = [
+  'things i wish', 'how to', 'guide to', 'best ', ' vs ', 'why ',
+  'what to wear', 'trends', 'roundup', 'we tried',
+];
+
+function looksLikeProductPage(result) {
+  const url   = (result.url || '').toLowerCase();
+  const title = (result.title || '').toLowerCase();
+
+  if (NON_PRODUCT_URL_PATTERNS.some(p => url.includes(p))) return false;
+  if (NON_PRODUCT_TITLE_PATTERNS.some(p => title.includes(p))) return false;
+
+  // Plural category-style titles with no specific garment named
+  if (/^(women|men)('|’)?s\s+\w+(\s*&\s*\w+)?s?$/i.test(result.title || '')) return false;
+
+  return true;
 }
 
 // ── Search provider (Serper) ───────────────────────────────────────────────────
@@ -148,7 +195,7 @@ async function runSearch(query, numResults = 20) {
       snippet: item.snippet || '',
     }));
 
-  const kept = mapped.filter(r => r.url && !isExcluded(r.url));
+  const kept = mapped.filter(r => r.url && !isExcluded(r.url) && looksLikeProductPage(r));
 
   if (mapped.length > 0 && kept.length === 0) {
     console.log('[search] all results excluded by domain filter; domains were:',
@@ -199,14 +246,17 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
       `isn't mentioned at all, judge from the brand and product type — many natural fibre ` +
       `labels don't state composition in search snippets, so absence of mention is NOT ` +
       `by itself a reason to reject.\n` +
+      `- is_product_page: true only if this is a single specific purchasable garment. ` +
+      `False for category/collection listings ("Women's Sweaters"), blog posts, guides, ` +
+      `or lookbooks — those can't be linked to as an alternative.\n` +
       `- visual_match: 0-10, how closely this resembles the shopper's garment in ` +
       `silhouette, pattern, and overall character. Be strict — 7+ means genuinely similar, ` +
-      `not just "same category".\n` +
+      `not just "same category". Score 0 if is_product_page is false.\n` +
       `- indie: true if this reads as an independent/small label rather than a large ` +
       `chain or department store.\n\n` +
       `Candidates:\n${listing}\n\n` +
       `Respond ONLY with JSON, no other text:\n` +
-      `{ "results": [ { "index": 0, "natural_fibre_likely": true, "visual_match": 8, "indie": true } ] }`,
+      `{ "results": [ { "index": 0, "natural_fibre_likely": true, "is_product_page": true, "visual_match": 8, "indie": true } ] }`,
   });
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -244,6 +294,7 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
       return {
         ...candidate,
         natural_fibre_likely: !!r.natural_fibre_likely,
+        is_product_page:      r.is_product_page !== false,
         visual_match:         Number(r.visual_match) || 0,
         indie:                !!r.indie,
       };
@@ -266,7 +317,7 @@ const MAX_INDIE_RESULTS = 3;
  */
 function compose(verified) {
   const eligible = verified
-    .filter(r => r.natural_fibre_likely && r.visual_match >= MIN_VISUAL_MATCH)
+    .filter(r => r.natural_fibre_likely && r.is_product_page && r.visual_match >= MIN_VISUAL_MATCH)
     .sort((a, b) => b.visual_match - a.visual_match);
 
   const affiliatePick = eligible.find(r => isAffiliateRetailer(r.url)) || null;
@@ -388,7 +439,7 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { imageUrl, category, attributes, fibre } = req.body || {};
+  const { imageUrl, category, attributes, fibre, searchQuery } = req.body || {};
 
   try {
     const sourceAttrs = attributes || {};
@@ -399,6 +450,7 @@ module.exports = async function handler(req, res) {
       colorFamily: sourceAttrs.color_family,
       silhouette:  sourceAttrs.silhouette,
       lane:        'affiliate',
+      searchQuery,
     });
     const indieQuery = buildQuery({
       category,
@@ -406,6 +458,7 @@ module.exports = async function handler(req, res) {
       colorFamily: sourceAttrs.color_family,
       silhouette:  sourceAttrs.silhouette,
       lane:        'indie',
+      searchQuery,
     });
 
     // Run both lanes. The affiliate lane is a narrower query (it'll naturally
@@ -443,6 +496,7 @@ module.exports = async function handler(req, res) {
     console.log('[search] verification:', {
       verified:      verified.length,
       naturalFibre:  verified.filter(r => r.natural_fibre_likely).length,
+      productPages:  verified.filter(r => r.is_product_page).length,
       passedVisual:  verified.filter(r => r.visual_match >= MIN_VISUAL_MATCH).length,
       passedBoth:    verified.filter(r => r.natural_fibre_likely && r.visual_match >= MIN_VISUAL_MATCH).length,
       shown:         alternatives.length,
@@ -456,7 +510,7 @@ module.exports = async function handler(req, res) {
     // shopper's item while still being a perfectly good catalogue product.
     // Deliberately not awaited — the shopper shouldn't wait on a write that
     // doesn't affect their result.
-    const worthCapturing = verified.filter(r => r.natural_fibre_likely);
+    const worthCapturing = verified.filter(r => r.natural_fibre_likely && r.is_product_page);
     writeToStaging(worthCapturing, indieQuery).catch(err =>
       console.error('staging write-back failed:', err.message)
     );
