@@ -289,7 +289,7 @@ const HARD_MAX_FACTOR = 2.50;
 // Calls the sibling api/search.js endpoint. Kept as an HTTP call rather than a
 // direct import so the two lanes stay independently deployable and one failing
 // can't take the other down.
-async function runSearchFallback({ imageUrl, category, attributes, fibres, searchQuery }) {
+async function runSearchFallback({ imageUrl, category, attributes, fibres, searchQuery, sourcePriceUsd }) {
   const base = process.env.SEARCH_API_BASE || 'https://taglio-api.vercel.app';
 
   // Pass the dominant natural fibre (if the source item has one) so the search
@@ -302,7 +302,7 @@ async function runSearchFallback({ imageUrl, category, attributes, fibres, searc
   const res = await fetch(`${base}/api/search`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ imageUrl, category, attributes, fibre: dominantNatural, searchQuery }),
+    body:    JSON.stringify({ imageUrl, category, attributes, fibre: dominantNatural, searchQuery, sourcePriceUsd }),
   });
 
   if (!res.ok) throw new Error(`search endpoint returned ${res.status}`);
@@ -411,6 +411,7 @@ module.exports = async function handler(req, res) {
       attributes: sourceAttrs,
       fibres,
       searchQuery,
+      sourcePriceUsd: priceBaseUsd,
     }).catch(searchErr => {
       // Search failing must never break the response — the catalogue result
       // (even an empty one) is still worth returning.
