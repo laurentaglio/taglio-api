@@ -100,6 +100,12 @@ function normalizeCategory(raw) {
 
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 
+// Trailing slashes on the configured URL produce "//rest/v1/..." which
+// PostgREST rejects as an invalid path (PGRST125), so normalise once here.
+function supabaseBase() {
+  return (process.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
+}
+
 function supabaseHeaders() {
   const key = process.env.VITE_SUPABASE_ANON_KEY;
   return { apikey: key, Authorization: `Bearer ${key}` };
@@ -108,12 +114,18 @@ function supabaseHeaders() {
 async function toUsd(amount, currency) {
   if (!currency || currency === 'USD') return amount;
 
-  const base = process.env.VITE_SUPABASE_URL;
+  const base = supabaseBase();
   const res = await fetch(
     `${base}/rest/v1/fx_rates?currency=eq.${encodeURIComponent(currency)}&order=rate_date.desc&limit=1&select=rate_to_usd`,
     { headers: supabaseHeaders() }
   );
-  if (!res.ok) return amount;
+  if (!res.ok) {
+    // Log rather than silently returning the unconverted amount — a failing FX
+    // lookup means every price comparison downstream is wrong, and swallowing
+    // it makes that invisible.
+    console.error('[fx] lookup failed:', res.status, (await res.text()).slice(0, 200));
+    return amount;
+  }
   const rows = await res.json();
   const rate = rows[0]?.rate_to_usd;
   return rate ? amount * Number(rate) : amount;
@@ -129,7 +141,7 @@ const CANDIDATE_POOL_SIZE = 20;
 const RESULTS_PER_TIER    = 3;
 
 async function queryTier(category, minUsd, maxUsd) {
-  const base = process.env.VITE_SUPABASE_URL;
+  const base = supabaseBase();
 
   const params = [
     `select=${encodeURIComponent('id,brand,name,url,image_url,price_original,currency_original,price_base,fibre_composition,pattern,embellishments,silhouette,color_family')}`,
@@ -141,10 +153,17 @@ async function queryTier(category, minUsd, maxUsd) {
     `limit=${CANDIDATE_POOL_SIZE}`,
   ].join('&');
 
-  const res = await fetch(`${base}/rest/v1/products?${params}`, {
-    headers: supabaseHeaders(),
-  });
-  if (!res.ok) return [];
+  const url = `${base}/rest/v1/products?${params}`;
+  const res = await fetch(url, { headers: supabaseHeaders() });
+
+  if (!res.ok) {
+    // Previously returned [] silently, which made a failing query
+    // indistinguishable from a genuinely empty catalogue — masking real errors
+    // (wrong URL, table not exposed, RLS) as "no matches found".
+    console.error('[catalogue] query failed:', res.status,
+      (await res.text()).slice(0, 200), 'url:', url);
+    return [];
+  }
   const rows = await res.json();
   return Array.isArray(rows) ? rows : [];
 }
