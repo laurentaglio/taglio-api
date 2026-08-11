@@ -163,46 +163,89 @@ function looksLikeProductPage(result) {
  * shopping results do, so price often arrives null and images come from the
  * page rather than a product feed. Worth it for real merchant links.
  */
+/*
+ * Uses Serper's /shopping endpoint.
+ *
+ * Shopping results carry the structured data we actually need — price, currency,
+ * product image, merchant name — which regular web search does not. The one
+ * problem with them is that `link` often points at a Google Shopping page rather
+ * than the merchant's own site. That's a link-resolution problem (handled by
+ * resolveMerchantUrl below), NOT a reason to abandon the data source: switching
+ * to web search fixed the links but threw away prices, images and tiers with them.
+ */
 async function runSearch(query, numResults = 20) {
   const key = process.env.SERPER_API_KEY;
   if (!key) throw new Error('SERPER_API_KEY not configured');
 
-  const res = await fetch('https://google.serper.dev/search', {
+  const res = await fetch('https://google.serper.dev/shopping', {
     method: 'POST',
     headers: {
       'X-API-KEY': key,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ q: query, num: numResults }),
+    body: JSON.stringify({ q: query, num: numResults, gl: 'us', hl: 'en' }),
   });
 
   if (!res.ok) throw new Error(`Serper error: ${res.status}`);
 
   const data = await res.json();
-  const items = data.organic || [];
+  const items = data.shopping || [];
 
   if (items.length === 0) {
     console.log('[search] serper returned no items; response keys:', Object.keys(data));
+    return [];
   }
 
-  const mapped = items
-    .map(item => ({
-      title:  item.title || '',
-      url:    item.link || '',
-      image:  item.imageUrl || item.thumbnail || null,
-      price:  item.price || null,
-      source: domainOf(item.link || ''),
-      snippet: item.snippet || '',
-    }));
+  // One-time visibility into what fields shopping results actually carry, so we
+  // can see which one holds a real merchant URL. Remove once link resolution is
+  // confirmed working.
+  console.log('[search] sample shopping item:', JSON.stringify(items[0]).slice(0, 500));
 
-  const kept = mapped.filter(r => r.url && !isExcluded(r.url) && looksLikeProductPage(r));
+  const mapped = items.map(item => ({
+    title:        item.title || '',
+    url:          resolveMerchantUrl(item),
+    googleUrl:    item.link || '',
+    image:        item.imageUrl || item.thumbnail || null,
+    price:        item.price || null,
+    priceValue:   typeof item.priceValue === 'number' ? item.priceValue : null,
+    currency:     item.currency || null,
+    source:       item.source || '',        // merchant name, e.g. "Everlane"
+    snippet:      item.snippet || item.delivery || '',
+  }));
 
-  if (mapped.length > 0 && kept.length === 0) {
-    console.log('[search] all results excluded by domain filter; domains were:',
-      mapped.map(r => domainOf(r.url)).slice(0, 10));
-  }
+  // Only keep results where we have a real merchant URL — a Google Shopping
+  // link is not something we can send a shopper to, or attach affiliate
+  // tracking to.
+  const kept = mapped.filter(r => r.url && !isExcluded(r.url));
+
+  console.log('[search] shopping results:', {
+    returned:        items.length,
+    merchantUrlOk:   mapped.filter(r => r.url).length,
+    afterExclusions: kept.length,
+  });
 
   return kept;
+}
+
+/*
+ * Shopping results expose the destination merchant in different fields
+ * depending on the result type. Try each in turn; return null if all we have
+ * is a Google-owned URL, since that can't be linked to or affiliate-tracked.
+ */
+function resolveMerchantUrl(item) {
+  const candidates = [
+    item.productLink,     // direct merchant link on some results
+    item.merchantLink,
+    item.offerLink,
+    item.link,            // often google.com/shopping/... — checked last
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const d = domainOf(candidate);
+    if (d && !d.includes('google.')) return candidate;
+  }
+
+  return null;
 }
 
 // ── Claude verification ────────────────────────────────────────────────────────
@@ -240,12 +283,12 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
       `The image above (if present) is the garment a shopper is currently viewing.\n` +
       `Its attributes: ${JSON.stringify(sourceAttrs || {})}\n\n` +
       `Below are candidate alternative products found via search. For each, judge:\n` +
-      `- natural_fibre_likely: true if the title or snippet suggests a predominantly ` +
-      `natural fibre shell (linen, cotton, wool, silk, cashmere, hemp). If it explicitly ` +
-      `mentions polyester/nylon/acrylic as the main fabric, use false. If fibre content ` +
-      `isn't mentioned at all, judge from the brand and product type — many natural fibre ` +
-      `labels don't state composition in search snippets, so absence of mention is NOT ` +
-      `by itself a reason to reject.\n` +
+      `- natural_fibre_likely: true ONLY if the title or snippet gives positive evidence ` +
+      `of a natural fibre shell — it names linen, cotton, wool, silk, cashmere or hemp. ` +
+      `If it mentions polyester/nylon/acrylic/viscose, use false. If fibre content is not ` +
+      `mentioned at all, use false: absence of evidence is not evidence, and surfacing a ` +
+      `synthetic garment as a natural alternative is the worst failure this product can have. ` +
+      `Do not infer fibre from brand reputation or how a garment looks.\n` +
       `- is_product_page: true only if this is a single specific purchasable garment. ` +
       `False for category/collection listings ("Women's Sweaters"), blog posts, guides, ` +
       `or lookbooks — those can't be linked to as an alternative.\n` +
@@ -253,10 +296,14 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
       `silhouette, pattern, and overall character. Be strict — 7+ means genuinely similar, ` +
       `not just "same category". Score 0 if is_product_page is false.\n` +
       `- indie: true if this reads as an independent/small label rather than a large ` +
-      `chain or department store.\n\n` +
+      `chain or department store.\n` +
+      `- brand_name: the brand's proper name, cleaned up (e.g. "Astr The Label", not ` +
+      `"astrthelabel.com"). Use the domain only if no brand name is discernible.\n` +
+      `- product_name: the garment's name, with site boilerplate and the brand name ` +
+      `stripped (e.g. "Adeline Knit Top", not "Adeline Knit Top | Shop Now | Brand").\n\n` +
       `Candidates:\n${listing}\n\n` +
       `Respond ONLY with JSON, no other text:\n` +
-      `{ "results": [ { "index": 0, "natural_fibre_likely": true, "is_product_page": true, "visual_match": 8, "indie": true } ] }`,
+      `{ "results": [ { "index": 0, "natural_fibre_likely": true, "is_product_page": true, "visual_match": 8, "indie": true, "brand_name": "Astr The Label", "product_name": "Adeline Knit Top" } ] }`,
   });
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -297,12 +344,53 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
         is_product_page:      r.is_product_page !== false,
         visual_match:         Number(r.visual_match) || 0,
         indie:                !!r.indie,
+        brand_name:           typeof r.brand_name === 'string' ? r.brand_name : null,
+        product_name:         typeof r.product_name === 'string' ? r.product_name : null,
       };
     })
     .filter(Boolean);
 }
 
-// ── Result composition ─────────────────────────────────────────────────────────
+// ── Price handling ─────────────────────────────────────────────────────────────
+
+/*
+ * Shopping results give price as a display string ("$128.00") and sometimes a
+ * numeric priceValue. Only show something that actually reads as a price — a
+ * bare number with no currency is worse than showing nothing, since the shopper
+ * can't tell what it means.
+ */
+function formatSearchPrice(r) {
+  if (typeof r.price === 'string' && /[£€$¥]|\d[.,]\d{2}/.test(r.price)) return r.price;
+  if (typeof r.priceValue === 'number' && r.currency) {
+    const symbols = { USD: '$', GBP: '£', EUR: '€', JPY: '¥' };
+    return (symbols[r.currency] || r.currency + '\u00a0') + r.priceValue.toFixed(2).replace(/\.00$/, '');
+  }
+  return '';
+}
+
+/*
+ * Buckets a search result into the same price tiers the catalogue uses, so
+ * discoveries slot into the existing "Similar price / Investment pick /
+ * Everyday alternative" framing rather than being an untiered pile.
+ * Returns null when we have no usable price — those fall back to 'discovery'.
+ */
+function assignTier(r, sourcePriceUsd) {
+  if (!sourcePriceUsd || sourcePriceUsd <= 0) return null;
+
+  const value = typeof r.priceValue === 'number'
+    ? r.priceValue
+    : parseFloat(String(r.price || '').replace(/[^\d.]/g, ''));
+
+  if (!value || Number.isNaN(value)) return null;
+
+  const ratio = value / sourcePriceUsd;
+  if (ratio < 0.30 || ratio > 2.50) return null;   // outside hard bounds
+  if (ratio <= 0.70) return 'accessible';
+  if (ratio <= 1.30) return 'similar';
+  return 'elevated';
+}
+
+
 
 const MIN_VISUAL_MATCH = 6;   // below this, it's not a real alternative
 const MAX_INDIE_RESULTS = 3;
@@ -315,7 +403,7 @@ const MAX_INDIE_RESULTS = 3;
  * than promoting a weak affiliate match — a bad primary card is worse than
  * no affiliate link on that view.
  */
-function compose(verified) {
+function compose(verified, sourcePriceUsd) {
   const eligible = verified
     .filter(r => r.natural_fibre_likely && r.is_product_page && r.visual_match >= MIN_VISUAL_MATCH)
     .sort((a, b) => b.visual_match - a.visual_match);
@@ -333,11 +421,11 @@ function compose(verified) {
     : [];
 
   const toAlt = (r, tier) => ({
-    brand:        r.source,
-    product:      r.title,
+    brand:        r.brand_name || r.source || domainOf(r.url),
+    product:      r.product_name || r.title,
     url:          r.url,
     image:        r.image,
-    price:        r.price || '',
+    price:        formatSearchPrice(r),
     tier,
     material:     '',            // unknown until verified — deliberately blank
     match_score:  r.visual_match,
@@ -347,8 +435,12 @@ function compose(verified) {
   });
 
   const alternatives = [];
-  if (affiliatePick) alternatives.push(toAlt(affiliatePick, 'similar'));
-  [...indiePicks, ...filler].forEach(r => alternatives.push(toAlt(r, 'discovery')));
+  if (affiliatePick) {
+    alternatives.push(toAlt(affiliatePick, assignTier(affiliatePick, sourcePriceUsd) || 'discovery'));
+  }
+  [...indiePicks, ...filler].forEach(r =>
+    alternatives.push(toAlt(r, assignTier(r, sourcePriceUsd) || 'discovery'))
+  );
 
   return alternatives;
 }
@@ -452,7 +544,7 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { imageUrl, category, attributes, fibre, searchQuery } = req.body || {};
+  const { imageUrl, category, attributes, fibre, searchQuery, sourcePriceUsd } = req.body || {};
 
   try {
     const sourceAttrs = attributes || {};
@@ -504,7 +596,7 @@ module.exports = async function handler(req, res) {
     }
 
     const verified     = await verifyCandidates(imageUrl, sourceAttrs, candidates);
-    const alternatives = compose(verified);
+    const alternatives = compose(verified, sourcePriceUsd);
 
     console.log('[search] verification:', {
       verified:      verified.length,
