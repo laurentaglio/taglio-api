@@ -81,16 +81,21 @@ const NATURAL_FIBRE_TERMS = ['linen', 'cotton', 'wool', 'silk', 'cashmere', 'hem
 function buildQuery({ category, fibre, colorFamily, silhouette, lane }) {
   const parts = [];
 
-  if (fibre) parts.push(`100% ${fibre}`);
+  if (fibre) parts.push(`${fibre}`);
   else parts.push(NATURAL_FIBRE_TERMS.slice(0, 3).join(' OR '));
 
   if (colorFamily && colorFamily !== 'multicolor') parts.push(colorFamily);
   if (silhouette && silhouette !== 'other') parts.push(silhouette.replace(/_/g, ' '));
   parts.push(category || 'clothing');
 
+  // Web search (unlike shopping search) will happily return blog posts and
+  // listicles, so we need shopping intent in the query itself to bias toward
+  // actual product pages.
+  parts.push('buy');
+
   if (lane === 'indie') {
-    // Terms that skew toward independent labels' own product pages
-    parts.push('independent brand');
+    // Nudges away from the big chains that dominate generic apparel queries
+    parts.push('small brand');
   }
 
   return parts.join(' ');
@@ -98,11 +103,24 @@ function buildQuery({ category, fibre, colorFamily, silhouette, lane }) {
 
 // ── Search provider (Serper) ───────────────────────────────────────────────────
 
+/*
+ * Uses Serper's regular web search endpoint, NOT /shopping.
+ *
+ * /shopping returns Google Shopping listings whose `link` points at
+ * google.com/shopping/product/... — aggregator pages, not merchant sites.
+ * Those fail the domain filter (correctly: they'd reintroduce the "opens to
+ * Google Shopping instead of the brand" problem) and can't carry an affiliate
+ * deep link. Regular web search returns the retailer's own product URLs.
+ *
+ * Tradeoff: web results don't carry structured price/image fields the way
+ * shopping results do, so price often arrives null and images come from the
+ * page rather than a product feed. Worth it for real merchant links.
+ */
 async function runSearch(query, numResults = 20) {
   const key = process.env.SERPER_API_KEY;
   if (!key) throw new Error('SERPER_API_KEY not configured');
 
-  const res = await fetch('https://google.serper.dev/shopping', {
+  const res = await fetch('https://google.serper.dev/search', {
     method: 'POST',
     headers: {
       'X-API-KEY': key,
@@ -114,11 +132,8 @@ async function runSearch(query, numResults = 20) {
   if (!res.ok) throw new Error(`Serper error: ${res.status}`);
 
   const data = await res.json();
-  const items = data.shopping || data.organic || [];
+  const items = data.organic || [];
 
-  // The /shopping endpoint's response shape was assumed, not verified — if
-  // `items` is empty but the response has other top-level keys, that mismatch
-  // is the bug. Logging keys rather than the full body to keep logs readable.
   if (items.length === 0) {
     console.log('[search] serper returned no items; response keys:', Object.keys(data));
   }
@@ -129,7 +144,8 @@ async function runSearch(query, numResults = 20) {
       url:    item.link || '',
       image:  item.imageUrl || item.thumbnail || null,
       price:  item.price || null,
-      source: item.source || domainOf(item.link || ''),
+      source: domainOf(item.link || ''),
+      snippet: item.snippet || '',
     }));
 
   const kept = mapped.filter(r => r.url && !isExcluded(r.url));
@@ -159,7 +175,12 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
   if (candidates.length === 0) return [];
 
   const listing = candidates
-    .map((c, i) => `${i}. ${c.title} — ${c.source}${c.price ? ` — ${c.price}` : ''}`)
+    .map((c, i) => {
+      const parts = [`${i}. ${c.title} — ${c.source}`];
+      if (c.price) parts.push(`— ${c.price}`);
+      if (c.snippet) parts.push(`\n   ${c.snippet.slice(0, 200)}`);
+      return parts.join(' ');
+    })
     .join('\n');
 
   const contentBlocks = [];
@@ -172,9 +193,12 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
       `The image above (if present) is the garment a shopper is currently viewing.\n` +
       `Its attributes: ${JSON.stringify(sourceAttrs || {})}\n\n` +
       `Below are candidate alternative products found via search. For each, judge:\n` +
-      `- natural_fibre_likely: true if the title/description suggests a predominantly ` +
-      `natural fibre shell (linen, cotton, wool, silk, cashmere, hemp). If the title ` +
-      `mentions polyester/nylon/acrylic, or gives no fibre indication at all, use false.\n` +
+      `- natural_fibre_likely: true if the title or snippet suggests a predominantly ` +
+      `natural fibre shell (linen, cotton, wool, silk, cashmere, hemp). If it explicitly ` +
+      `mentions polyester/nylon/acrylic as the main fabric, use false. If fibre content ` +
+      `isn't mentioned at all, judge from the brand and product type — many natural fibre ` +
+      `labels don't state composition in search snippets, so absence of mention is NOT ` +
+      `by itself a reason to reject.\n` +
       `- visual_match: 0-10, how closely this resembles the shopper's garment in ` +
       `silhouette, pattern, and overall character. Be strict — 7+ means genuinely similar, ` +
       `not just "same category".\n` +
