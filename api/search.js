@@ -1,50 +1,74 @@
 'use strict';
 
 /*
- * api/search.js — live product search lane
+ * api/search.js — live discovery lane with page-fetch verification
  *
- * Complements api/alternatives.js (the database lane). Where alternatives.js
- * queries the curated Supabase catalogue, this endpoint searches the live web
- * for natural fibre alternatives — the "discovery" path that surfaces indie
- * labels the catalogue doesn't cover yet.
+ * Called by api/alternatives.js when the curated catalogue can't answer.
  *
- * Two lanes, composed into one result set:
- *   - AFFILIATE lane: constrained to retailers we have (or expect to have) an
- *     affiliate relationship with. Guarantees at least one monetizable pick.
- *   - INDIE lane: biased toward independent natural fibre labels, with big
- *     aggregators and fast fashion filtered out. This is the differentiator.
+ * Pipeline:
+ *   1. Serper /shopping    → structured data (price, image, merchant name) but
+ *                            NO usable destination URL — every `link` is a
+ *                            google.com search URL.
+ *   2. Resolve merchant URL → a second Serper web search per candidate, using
+ *                            merchant name + product title, to find the real
+ *                            product page.
+ *   3. Fetch that page      → the only place actual fibre composition lives.
+ *                            Snippets don't reliably state it, and guessing
+ *                            from brand or appearance is how a polyester top
+ *                            ends up recommended as a natural alternative.
+ *   4. Verify with Claude   → composition, price, confirm it's the right garment.
+ *   5. Write to staging     → naturals as promotion candidates, everything else
+ *                            as a rejected skip-list entry so we never pay to
+ *                            re-verify the same URL.
  *
- * Results are returned in the SAME shape as alternatives.js so the extension
- * popup needs no changes to render them, with an added `source` field so the
- * UI can distinguish verified catalogue matches from live discoveries.
+ * Steps 2-4 are the expensive part. They're bounded by MAX_RESOLVE so a single
+ * scan can't fan out indefinitely.
  */
+
+// ── Fibre classification (mirrors alternatives.js) ─────────────────────────────
+
+const NATURAL_FIBRES = [
+  'cotton', 'linen', 'wool', 'silk', 'cashmere', 'hemp',
+  'jute', 'ramie', 'alpaca', 'mohair', 'angora', 'camel', 'flax',
+];
+const SEMI_SYNTHETIC = [
+  'viscose', 'ecovero', 'lyocell', 'tencel', 'modal', 'rayon', 'cupro', 'acetate', 'bamboo',
+];
+
+function isNatural(name) {
+  const l = String(name).toLowerCase();
+  if (SEMI_SYNTHETIC.some(n => l.includes(n))) return false;
+  return NATURAL_FIBRES.some(n => l.includes(n));
+}
+
+function naturalShare(fibres) {
+  let nat = 0, total = 0;
+  for (const [name, pct] of Object.entries(fibres || {})) {
+    const v = Number(pct) || 0;
+    total += v;
+    if (isNatural(name)) nat += v;
+  }
+  return total > 0 ? (nat / total) * 100 : 0;
+}
 
 // ── Retailer classification ────────────────────────────────────────────────────
 
-// Retailers we have or are pursuing affiliate relationships with. A result from
-// one of these can produce commission, so we guarantee one in the result set.
-// Extend this as Awin/CJ/Impact programs are approved.
+// Retailers we have (or are pursuing) an affiliate relationship with. One of
+// these is preferred for the primary slot since the click can actually earn.
+// Keep in sync with approved Awin/CJ/Impact programs.
 const AFFILIATE_RETAILERS = [
   'net-a-porter.com', 'matchesfashion.com', 'mytheresa.com',
   'nordstrom.com', 'saksfifthavenue.com', 'bloomingdales.com',
-  'arket.com', 'cosstores.com', 'everlane.com', 'reformation.com',
-  'sezane.com', 'toa.st', 'thereformation.com',
+  'arket.com', 'cosstores.com', 'everlane.com', 'thereformation.com',
+  'sezane.com', 'toa.st',
 ];
 
-// Never surface these: aggregators (no direct product page, breaks deep links),
-// marketplaces (unreliable fibre data), and fast fashion (wrong register for
-// the brand positioning entirely).
 const EXCLUDED_DOMAINS = [
-  // Aggregators / resale / marketplaces
-  'google.com', 'shopping.google.com', 'amazon.', 'ebay.', 'etsy.com',
-  'poshmark.com', 'depop.com', 'vinted.', 'thredup.com', 'therealreal.com',
-  'lyst.com', 'shopstyle.com', 'polyvore.com', 'pinterest.',
-  // Fast fashion
-  'shein.', 'temu.', 'romwe.', 'boohoo.', 'prettylittlething.',
-  'fashionnova.', 'forever21.', 'hm.com', 'zara.com', 'primark.',
-  'asos.com', 'missguided.', 'nastygal.',
-  // Editorial / non-shoppable
-  'wikipedia.org', 'reddit.com', 'youtube.com', 'tiktok.com',
+  'google.', 'amazon.', 'ebay.', 'etsy.com', 'poshmark.com', 'depop.com',
+  'vinted.', 'thredup.com', 'therealreal.com', 'lyst.com', 'shopstyle.com',
+  'pinterest.', 'shein.', 'temu.', 'romwe.', 'boohoo.', 'prettylittlething.',
+  'fashionnova.', 'forever21.', 'hm.com', 'zara.com', 'primark.', 'asos.com',
+  'wikipedia.org', 'reddit.com', 'youtube.com', 'tiktok.com', 'instagram.com',
 ];
 
 function domainOf(url) {
@@ -57,8 +81,7 @@ function domainOf(url) {
 
 function isExcluded(url) {
   const d = domainOf(url);
-  if (!d) return true;
-  return EXCLUDED_DOMAINS.some(bad => d.includes(bad));
+  return !d || EXCLUDED_DOMAINS.some(bad => d.includes(bad));
 }
 
 function isAffiliateRetailer(url) {
@@ -66,248 +89,227 @@ function isAffiliateRetailer(url) {
   return AFFILIATE_RETAILERS.some(r => d.includes(r));
 }
 
-// ── Query construction ─────────────────────────────────────────────────────────
+// ── Supabase helpers ───────────────────────────────────────────────────────────
 
-const NATURAL_FIBRE_TERMS = ['linen', 'cotton', 'wool', 'silk', 'cashmere', 'hemp'];
-
-/*
- * Builds a search query for a given lane.
- *
- * The indie lane deliberately avoids naming big retailers and leans on terms
- * that independent labels actually use in their product copy ("100% linen",
- * "made in", "small batch"). We can't hard-filter to indie domains in the
- * query itself, so filtering happens on the results — the query just biases.
- */
-/*
- * Builds a search query for a given lane.
- *
- * Prefers `searchQuery` — a natural garment description Claude wrote from the
- * product image ("womens tan linen midi dress square neck"). That works far
- * better than concatenated attributes: keyword soup like
- * "linen OR cotton OR wool blue fitted knit buy" returns category pages and
- * blog posts, because that's what generic keyword queries match.
- *
- * The attribute-built fallback only applies when Claude couldn't produce a
- * description (e.g. no product image available).
- */
-function buildQuery({ category, fibre, colorFamily, silhouette, lane, searchQuery }) {
-  const parts = [];
-
-  if (searchQuery) {
-    parts.push(searchQuery);
-  } else {
-    if (fibre) parts.push(fibre);
-    else parts.push(NATURAL_FIBRE_TERMS.slice(0, 3).join(' '));
-    if (colorFamily && colorFamily !== 'multicolor') parts.push(colorFamily);
-    if (silhouette && silhouette !== 'other') parts.push(silhouette.replace(/_/g, ' '));
-    parts.push(category || 'clothing');
-  }
-
-  if (lane === 'indie') {
-    // Nudges away from the big chains that dominate generic apparel queries
-    parts.push('independent label');
-  } else {
-    parts.push('shop');
-  }
-
-  return parts.join(' ');
+function supabaseBase() {
+  return (process.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
 }
 
-// ── Product page detection ─────────────────────────────────────────────────────
-
-/*
- * Web search returns category pages ("Women's Sweaters & Cardigans"), blog
- * posts ("12 Things I Wish I Knew Before Knitting"), and lookbooks alongside
- * actual products. None of those are usable as alternatives — you can't link a
- * shopper to a category page and call it a match.
- *
- * This is a cheap pre-filter on URL shape and title; Claude does the more
- * reliable judgement in the verification pass.
- */
-const NON_PRODUCT_URL_PATTERNS = [
-  '/blog/', '/journal/', '/magazine/', '/stories/', '/guide',
-  '/collections/all', '/category/', '/categories/', '/c/',
-  '/search', '/help', '/about', '/lookbook', '/edit/',
-];
-
-const NON_PRODUCT_TITLE_PATTERNS = [
-  'things i wish', 'how to', 'guide to', 'best ', ' vs ', 'why ',
-  'what to wear', 'trends', 'roundup', 'we tried',
-];
-
-function looksLikeProductPage(result) {
-  const url   = (result.url || '').toLowerCase();
-  const title = (result.title || '').toLowerCase();
-
-  if (NON_PRODUCT_URL_PATTERNS.some(p => url.includes(p))) return false;
-  if (NON_PRODUCT_TITLE_PATTERNS.some(p => title.includes(p))) return false;
-
-  // Plural category-style titles with no specific garment named
-  if (/^(women|men)('|’)?s\s+\w+(\s*&\s*\w+)?s?$/i.test(result.title || '')) return false;
-
-  return true;
+function serviceHeaders() {
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  return {
+    apikey:         key,
+    Authorization:  `Bearer ${key}`,
+    'Content-Type': 'application/json',
+  };
 }
 
-// ── Search provider (Serper) ───────────────────────────────────────────────────
+function hasServiceCredentials() {
+  return !!(supabaseBase() && process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
 /*
- * Uses Serper's regular web search endpoint, NOT /shopping.
- *
- * /shopping returns Google Shopping listings whose `link` points at
- * google.com/shopping/product/... — aggregator pages, not merchant sites.
- * Those fail the domain filter (correctly: they'd reintroduce the "opens to
- * Google Shopping instead of the brand" problem) and can't carry an affiliate
- * deep link. Regular web search returns the retailer's own product URLs.
- *
- * Tradeoff: web results don't carry structured price/image fields the way
- * shopping results do, so price often arrives null and images come from the
- * page rather than a product feed. Worth it for real merchant links.
+ * Returns a Set of URLs already in staging, so we skip re-resolving and
+ * re-verifying anything we've seen — including rejects. This is the whole
+ * point of storing rejections: a polyester item confirmed once should never
+ * cost another page fetch.
  */
-/*
- * Uses Serper's /shopping endpoint.
- *
- * Shopping results carry the structured data we actually need — price, currency,
- * product image, merchant name — which regular web search does not. The one
- * problem with them is that `link` often points at a Google Shopping page rather
- * than the merchant's own site. That's a link-resolution problem (handled by
- * resolveMerchantUrl below), NOT a reason to abandon the data source: switching
- * to web search fixed the links but threw away prices, images and tiers with them.
- */
-async function runSearch(query, numResults = 20) {
+async function loadSeenUrls(urls) {
+  if (!hasServiceCredentials() || urls.length === 0) return new Set();
+
+  try {
+    const list = urls.map(u => `"${u.replace(/"/g, '')}"`).join(',');
+    const res = await fetch(
+      `${supabaseBase()}/rest/v1/products_staging?select=url&url=in.(${encodeURIComponent(list)})`,
+      { headers: serviceHeaders() }
+    );
+    if (!res.ok) {
+      console.error('[staging] seen-lookup failed:', res.status, (await res.text()).slice(0, 200));
+      return new Set();
+    }
+    const rows = await res.json();
+    return new Set(rows.map(r => r.url));
+  } catch (err) {
+    console.error('[staging] seen-lookup error:', err.message);
+    return new Set();
+  }
+}
+
+async function writeToStaging(rows) {
+  if (!hasServiceCredentials()) {
+    console.warn('[staging] skipped: service credentials not configured');
+    return;
+  }
+  if (rows.length === 0) {
+    console.log('[staging] nothing to write');
+    return;
+  }
+
+  const url = `${supabaseBase()}/rest/v1/products_staging?on_conflict=url`;
+
+  try {
+    const res = await fetch(url, {
+      method:  'POST',
+      headers: { ...serviceHeaders(), Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body:    JSON.stringify(rows),
+    });
+
+    if (!res.ok) {
+      console.error('[staging] write failed:', res.status, (await res.text()).slice(0, 300), 'url:', url);
+      return;
+    }
+    console.log('[staging] wrote', rows.length, 'rows');
+  } catch (err) {
+    console.error('[staging] write error:', err.message);
+  }
+}
+
+// ── Step 1: shopping search ────────────────────────────────────────────────────
+
+async function shoppingSearch(query, gl = 'us') {
   const key = process.env.SERPER_API_KEY;
   if (!key) throw new Error('SERPER_API_KEY not configured');
 
   const res = await fetch('https://google.serper.dev/shopping', {
-    method: 'POST',
-    headers: {
-      'X-API-KEY': key,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ q: query, num: numResults, gl: 'us', hl: 'en' }),
+    method:  'POST',
+    headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ q: query, num: 20, gl, hl: 'en' }),
   });
 
-  if (!res.ok) throw new Error(`Serper error: ${res.status}`);
+  if (!res.ok) throw new Error(`Serper shopping error: ${res.status}`);
 
   const data = await res.json();
-  const items = data.shopping || [];
-
-  if (items.length === 0) {
-    console.log('[search] serper returned no items; response keys:', Object.keys(data));
-    return [];
-  }
-
-  // One-time visibility into what fields shopping results actually carry, so we
-  // can see which one holds a real merchant URL. Remove once link resolution is
-  // confirmed working.
-  console.log('[search] sample shopping item:', JSON.stringify(items[0]).slice(0, 500));
-
-  const mapped = items.map(item => ({
-    title:        item.title || '',
-    url:          resolveMerchantUrl(item),
-    googleUrl:    item.link || '',
-    image:        item.imageUrl || item.thumbnail || null,
-    price:        item.price || null,
-    priceValue:   typeof item.priceValue === 'number' ? item.priceValue : null,
-    currency:     item.currency || null,
-    source:       item.source || '',        // merchant name, e.g. "Everlane"
-    snippet:      item.snippet || item.delivery || '',
+  return (data.shopping || []).map(item => ({
+    title:      item.title || '',
+    merchant:   item.source || '',
+    price:      item.price || null,
+    priceValue: typeof item.priceValue === 'number' ? item.priceValue : null,
+    image:      item.imageUrl || null,
   }));
-
-  // Only keep results where we have a real merchant URL — a Google Shopping
-  // link is not something we can send a shopper to, or attach affiliate
-  // tracking to.
-  const kept = mapped.filter(r => r.url && !isExcluded(r.url));
-
-  console.log('[search] shopping results:', {
-    returned:        items.length,
-    merchantUrlOk:   mapped.filter(r => r.url).length,
-    afterExclusions: kept.length,
-  });
-
-  return kept;
 }
 
-/*
- * Shopping results expose the destination merchant in different fields
- * depending on the result type. Try each in turn; return null if all we have
- * is a Google-owned URL, since that can't be linked to or affiliate-tracked.
- */
-function resolveMerchantUrl(item) {
-  const candidates = [
-    item.productLink,     // direct merchant link on some results
-    item.merchantLink,
-    item.offerLink,
-    item.link,            // often google.com/shopping/... — checked last
-  ].filter(Boolean);
+// ── Step 2: resolve a real merchant product URL ────────────────────────────────
 
-  for (const candidate of candidates) {
-    const d = domainOf(candidate);
-    if (d && !d.includes('google.')) return candidate;
+/*
+ * Shopping results carry no destination URL, so we search the web for the exact
+ * merchant + product and take the first result on the merchant's own domain.
+ * Requiring a domain match is what stops us resolving to a marketplace listing
+ * or a review blog that happens to mention the product.
+ */
+async function resolveMerchantUrl(candidate) {
+  const key = process.env.SERPER_API_KEY;
+  const query = `${candidate.merchant} ${candidate.title}`.trim();
+
+  try {
+    const res = await fetch('https://google.serper.dev/search', {
+      method:  'POST',
+      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ q: query, num: 5 }),
+    });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const merchantToken = candidate.merchant.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    for (const item of (data.organic || [])) {
+      const link = item.link || '';
+      if (!link || isExcluded(link)) continue;
+
+      const d = domainOf(link).replace(/[^a-z0-9]/g, '');
+      // Accept when the merchant name appears in the domain — the signal that
+      // this is the brand's own site rather than a third party selling it.
+      if (merchantToken && d.includes(merchantToken.slice(0, 8))) return link;
+    }
+
+    // Fall back to the first non-excluded result if no domain match. Weaker,
+    // but better than dropping a candidate we have good shopping data for.
+    const first = (data.organic || []).map(i => i.link).find(l => l && !isExcluded(l));
+    return first || null;
+  } catch (err) {
+    console.error('[resolve] failed for', query, err.message);
+    return null;
   }
-
-  return null;
 }
 
-// ── Claude verification ────────────────────────────────────────────────────────
+// ── Step 3: fetch the product page ─────────────────────────────────────────────
 
 /*
- * Search results give us a title, an image and a price — but no verified fibre
- * content. This step asks Claude to judge, from the listing image and title,
- * whether each candidate is plausibly a natural fibre garment AND a visual
- * match for the source item.
- *
- * IMPORTANT: this is a *plausibility* check, not a guarantee. Unlike catalogue
- * products (where fibre content was verified at ingestion), these results are
- * returned to the UI marked `verified: false` so the extension can label them
- * as discoveries rather than confirmed matches.
+ * The page is the only reliable source of fibre composition. Strips tags and
+ * keeps a chunk of text — enough for composition to appear, bounded so we
+ * don't ship an entire page into the model.
  */
-async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
-  if (candidates.length === 0) return [];
+async function fetchPageText(url) {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; TaglioBot/1.0)',
+        'Accept':     'text/html',
+      },
+      redirect: 'follow',
+    });
+    if (!res.ok) return null;
 
-  const listing = candidates
-    .map((c, i) => {
-      const parts = [`${i}. ${c.title} — ${c.source}`];
-      if (c.price) parts.push(`— ${c.price}`);
-      if (c.snippet) parts.push(`\n   ${c.snippet.slice(0, 200)}`);
-      return parts.join(' ');
-    })
-    .join('\n');
+    const html = await res.text();
 
-  const contentBlocks = [];
+    // Prefer JSON-LD when present — it's structured and usually carries
+    // material and price without the surrounding page noise.
+    const jsonLd = [...html.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)]
+      .map(m => m[1])
+      .join(' ')
+      .slice(0, 3000);
+
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // Bias toward the part of the page mentioning composition
+    const pctIndex = text.search(/\d{1,3}\s*%/);
+    const chunk = pctIndex > 0
+      ? text.slice(Math.max(0, pctIndex - 1500), pctIndex + 1500)
+      : text.slice(0, 3000);
+
+    return (jsonLd ? jsonLd + ' ' : '') + chunk;
+  } catch (err) {
+    console.error('[fetch] failed for', url, err.message);
+    return null;
+  }
+}
+
+// ── Step 4: verify with Claude ─────────────────────────────────────────────────
+
+async function verifyProduct({ sourceImageUrl, sourceAttrs, candidate, pageText }) {
+  const blocks = [];
   if (sourceImageUrl) {
-    contentBlocks.push({ type: 'image', source: { type: 'url', url: sourceImageUrl } });
+    blocks.push({ type: 'image', source: { type: 'url', url: sourceImageUrl } });
   }
-  contentBlocks.push({
+  blocks.push({
     type: 'text',
     text:
-      `The image above (if present) is the garment a shopper is currently viewing.\n` +
+      `The image above (if present) is the garment a shopper is viewing.\n` +
       `Its attributes: ${JSON.stringify(sourceAttrs || {})}\n\n` +
-      `Below are candidate alternative products found via search. For each, judge:\n` +
-      `- natural_fibre_likely: true ONLY if the title or snippet gives positive evidence ` +
-      `of a natural fibre shell — it names linen, cotton, wool, silk, cashmere or hemp. ` +
-      `If it mentions polyester/nylon/acrylic/viscose, use false. If fibre content is not ` +
-      `mentioned at all, use false: absence of evidence is not evidence, and surfacing a ` +
-      `synthetic garment as a natural alternative is the worst failure this product can have. ` +
-      `Do not infer fibre from brand reputation or how a garment looks.\n` +
-      `- is_product_page: true only if this is a single specific purchasable garment. ` +
-      `False for category/collection listings ("Women's Sweaters"), blog posts, guides, ` +
-      `or lookbooks — those can't be linked to as an alternative.\n` +
+      `Below is text from a candidate alternative's product page.\n` +
+      `Product: ${candidate.title}\nMerchant: ${candidate.merchant}\n\n` +
+      `PAGE TEXT:\n${(pageText || '').slice(0, 4000)}\n\n` +
+      `Extract and judge:\n` +
+      `- shell_fibres: the outer/shell fabric composition as fibre names mapped to ` +
+      `integer percentages, taken from the page text. If the page does not state ` +
+      `composition, return an empty object {}. Never guess.\n` +
+      `- price: the price as it appears on the page, with currency symbol, or null.\n` +
+      `- product_name: the garment name, cleaned of site boilerplate.\n` +
+      `- brand_name: the brand's proper name.\n` +
       `- visual_match: 0-10, how closely this resembles the shopper's garment in ` +
-      `silhouette, pattern, and overall character. Be strict — 7+ means genuinely similar, ` +
-      `not just "same category". Score 0 if is_product_page is false.\n` +
-      `- indie: true if this reads as an independent/small label rather than a large ` +
-      `chain or department store.\n` +
-      `- brand_name: the brand's proper name, cleaned up (e.g. "Astr The Label", not ` +
-      `"astrthelabel.com"). Use the domain only if no brand name is discernible.\n` +
-      `- product_name: the garment's name, with site boilerplate and the brand name ` +
-      `stripped (e.g. "Adeline Knit Top", not "Adeline Knit Top | Shop Now | Brand").\n\n` +
-      `Candidates:\n${listing}\n\n` +
-      `Respond ONLY with JSON, no other text:\n` +
-      `{ "results": [ { "index": 0, "natural_fibre_likely": true, "is_product_page": true, "visual_match": 8, "indie": true, "brand_name": "Astr The Label", "product_name": "Adeline Knit Top" } ] }`,
+      `silhouette, pattern and character. Be strict; 7+ means genuinely similar.\n` +
+      `- is_product_page: false if this is a category listing, blog post or guide.\n\n` +
+      `Respond ONLY with JSON:\n` +
+      `{ "shell_fibres": {"linen": 100}, "price": "$128.00", "product_name": "...", ` +
+      `"brand_name": "...", "visual_match": 8, "is_product_page": true }`,
   });
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
+    method:  'POST',
     headers: {
       'Content-Type':      'application/json',
       'x-api-key':         process.env.ANTHROPIC_API_KEY,
@@ -315,228 +317,66 @@ async function verifyCandidates(sourceImageUrl, sourceAttrs, candidates) {
     },
     body: JSON.stringify({
       model:      'claude-haiku-4-5',
-      max_tokens: 1024,
-      messages:   [{ role: 'user', content: contentBlocks }],
+      max_tokens: 500,
+      messages:   [{ role: 'user', content: blocks }],
     }),
   });
 
   if (!res.ok) throw new Error(`Anthropic error: ${res.status}`);
 
-  const data = await res.json();
-  const text = data?.content?.[0]?.text || '';
+  const data  = await res.json();
+  const text  = data?.content?.[0]?.text || '';
   const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return [];
+  if (!match) return null;
 
-  let parsed;
   try {
-    parsed = JSON.parse(match[0]);
+    return JSON.parse(match[0]);
   } catch (_) {
-    return [];
+    return null;
   }
-
-  return (parsed.results || [])
-    .map(r => {
-      const candidate = candidates[r.index];
-      if (!candidate) return null;
-      return {
-        ...candidate,
-        natural_fibre_likely: !!r.natural_fibre_likely,
-        is_product_page:      r.is_product_page !== false,
-        visual_match:         Number(r.visual_match) || 0,
-        indie:                !!r.indie,
-        brand_name:           typeof r.brand_name === 'string' ? r.brand_name : null,
-        product_name:         typeof r.product_name === 'string' ? r.product_name : null,
-      };
-    })
-    .filter(Boolean);
 }
 
-// ── Price handling ─────────────────────────────────────────────────────────────
+// ── Tiering ────────────────────────────────────────────────────────────────────
 
-/*
- * Shopping results give price as a display string ("$128.00") and sometimes a
- * numeric priceValue. Only show something that actually reads as a price — a
- * bare number with no currency is worse than showing nothing, since the shopper
- * can't tell what it means.
- */
-function formatSearchPrice(r) {
-  if (typeof r.price === 'string' && /[£€$¥]|\d[.,]\d{2}/.test(r.price)) return r.price;
-  if (typeof r.priceValue === 'number' && r.currency) {
-    const symbols = { USD: '$', GBP: '£', EUR: '€', JPY: '¥' };
-    return (symbols[r.currency] || r.currency + '\u00a0') + r.priceValue.toFixed(2).replace(/\.00$/, '');
-  }
-  return '';
+function parsePriceValue(priceStr, fallback) {
+  if (typeof fallback === 'number') return fallback;
+  const n = parseFloat(String(priceStr || '').replace(/[^\d.]/g, ''));
+  return Number.isNaN(n) ? null : n;
 }
 
-/*
- * Buckets a search result into the same price tiers the catalogue uses, so
- * discoveries slot into the existing "Similar price / Investment pick /
- * Everyday alternative" framing rather than being an untiered pile.
- * Returns null when we have no usable price — those fall back to 'discovery'.
- */
-function assignTier(r, sourcePriceUsd) {
-  if (!sourcePriceUsd || sourcePriceUsd <= 0) return null;
-
-  const value = typeof r.priceValue === 'number'
-    ? r.priceValue
-    : parseFloat(String(r.price || '').replace(/[^\d.]/g, ''));
-
-  if (!value || Number.isNaN(value)) return null;
-
+function assignTier(value, sourcePriceUsd) {
+  if (!value || !sourcePriceUsd || sourcePriceUsd <= 0) return null;
   const ratio = value / sourcePriceUsd;
-  if (ratio < 0.30 || ratio > 2.50) return null;   // outside hard bounds
+  if (ratio < 0.30 || ratio > 2.50) return null;
   if (ratio <= 0.70) return 'accessible';
   if (ratio <= 1.30) return 'similar';
   return 'elevated';
 }
 
+// ── Query construction ─────────────────────────────────────────────────────────
 
+function buildQuery({ searchQuery, category, fibre, color_family, silhouette, lane }) {
+  const parts = [];
 
-const MIN_VISUAL_MATCH = 6;   // below this, it's not a real alternative
-const MAX_INDIE_RESULTS = 3;
-
-/*
- * Composes the final result set: one affiliate-eligible pick (the reliably
- * monetizable option, shown as the primary card) plus indie discoveries.
- *
- * If no affiliate result clears the bar, we return indie results only rather
- * than promoting a weak affiliate match — a bad primary card is worse than
- * no affiliate link on that view.
- */
-function compose(verified, sourcePriceUsd) {
-  const eligible = verified
-    .filter(r => r.natural_fibre_likely && r.is_product_page && r.visual_match >= MIN_VISUAL_MATCH)
-    .sort((a, b) => b.visual_match - a.visual_match);
-
-  const affiliatePick = eligible.find(r => isAffiliateRetailer(r.url)) || null;
-
-  const indiePicks = eligible
-    .filter(r => r !== affiliatePick && r.indie)
-    .slice(0, MAX_INDIE_RESULTS);
-
-  // If we found nothing indie, fall back to any remaining eligible results so
-  // the shopper still sees options — just not labelled as indie discoveries.
-  const filler = indiePicks.length === 0
-    ? eligible.filter(r => r !== affiliatePick).slice(0, MAX_INDIE_RESULTS)
-    : [];
-
-  const toAlt = (r, tier) => ({
-    brand:        r.brand_name || r.source || domainOf(r.url),
-    product:      r.product_name || r.title,
-    url:          r.url,
-    image:        r.image,
-    price:        formatSearchPrice(r),
-    tier,
-    material:     '',            // unknown until verified — deliberately blank
-    match_score:  r.visual_match,
-    source:       'search',      // lets the popup distinguish from catalogue results
-    verified:     false,         // fibre content NOT confirmed; UI should label accordingly
-    affiliate:    isAffiliateRetailer(r.url),
-  });
-
-  const alternatives = [];
-  if (affiliatePick) {
-    alternatives.push(toAlt(affiliatePick, assignTier(affiliatePick, sourcePriceUsd) || 'discovery'));
+  if (searchQuery) {
+    parts.push(searchQuery);
+  } else {
+    if (fibre) parts.push(fibre);
+    if (color_family && color_family !== 'multicolor') parts.push(color_family);
+    if (silhouette && silhouette !== 'other') parts.push(silhouette.replace(/_/g, ' '));
+    parts.push(category || 'clothing');
   }
-  [...indiePicks, ...filler].forEach(r =>
-    alternatives.push(toAlt(r, assignTier(r, sourcePriceUsd) || 'discovery'))
-  );
 
-  return alternatives;
+  if (lane === 'indie') parts.push('independent brand');
+  return parts.join(' ');
 }
 
-// ── Staging write-back ─────────────────────────────────────────────────────────
+// ── Config ─────────────────────────────────────────────────────────────────────
 
-/*
- * Writes discovered products into products_staging so the catalogue grows from
- * real usage rather than only from manual seeding.
- *
- * Uses the SERVICE ROLE key, not the anon key: products_staging has RLS enabled
- * with no public policies, precisely because unverified rows must not be
- * reachable from the client. Never expose SUPABASE_SERVICE_ROLE_KEY to the
- * extension — it belongs only in this server-side function.
- *
- * Fire-and-forget by design: a staging write failing should never degrade what
- * the shopper sees, so errors are logged and swallowed.
- */
-async function writeToStaging(results, sourceQuery) {
-  // Strip any trailing slash — a base ending in "/" produces "//rest/v1/..."
-  // which PostgREST rejects as an invalid path (PGRST125).
-  const base = (process.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
-  const key  = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  console.log('[staging] called with', results.length, 'results; credentials present:',
-    { base: !!base, key: !!key });
-
-  if (!base || !key) {
-    console.warn('[staging] skipped: Supabase service credentials not configured');
-    return;
-  }
-  if (results.length === 0) {
-    console.log('[staging] nothing to write');
-    return;
-  }
-
-  const rows = results.map(r => ({
-    name:               r.title,
-    url:                r.url,
-    image_url:          r.image,
-    brand:              r.source,
-    source_domain:      domainOf(r.url),
-    source_query:       sourceQuery,
-    visual_match_score: r.visual_match,
-    fibre_confidence:   r.natural_fibre_likely ? 'likely' : 'unconfirmed',
-    review_status:      'pending',
-  }));
-
-  try {
-    // on_conflict on url + merge-duplicates: rediscovering a product updates it
-    // rather than erroring or duplicating. times_seen is bumped separately below.
-    const targetUrl = `${base}/rest/v1/products_staging?on_conflict=url`;
-    console.log('[staging] POST', targetUrl);
-
-    const res = await fetch(
-      targetUrl,
-      {
-        method: 'POST',
-        headers: {
-          apikey:          key,
-          Authorization:   `Bearer ${key}`,
-          'Content-Type':  'application/json',
-          Prefer:          'resolution=merge-duplicates,return=minimal',
-        },
-        body: JSON.stringify(rows),
-      }
-    );
-
-    if (!res.ok) {
-      const body = await res.text();
-      console.error('[staging] write failed:', res.status, body.slice(0, 300));
-      return;
-    }
-
-    console.log('[staging] wrote', rows.length, 'rows, status', res.status);
-
-    // Bump times_seen for any URL we've seen before. Done as a separate RPC-less
-    // update since PostgREST upsert can't express "increment on conflict".
-    await Promise.all(rows.map(row =>
-      fetch(
-        `${base}/rest/v1/rpc/increment_staging_seen`,
-        {
-          method: 'POST',
-          headers: {
-            apikey:         key,
-            Authorization:  `Bearer ${key}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ p_url: row.url }),
-        }
-      ).catch(() => {})   // best-effort; missing RPC shouldn't break anything
-    ));
-  } catch (err) {
-    console.error('staging write error:', err.message);
-  }
-}
+const MIN_VISUAL_MATCH  = 6;
+const MIN_NATURAL_SHARE = 50;   // shell must be predominantly natural to qualify
+const MAX_RESOLVE       = 8;    // caps per-scan cost and latency
+const MAX_SHOWN         = 3;
 
 // ── Handler ────────────────────────────────────────────────────────────────────
 
@@ -544,83 +384,130 @@ module.exports = async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const { imageUrl, category, attributes, fibre, searchQuery, sourcePriceUsd } = req.body || {};
+  const {
+    imageUrl, category, attributes, fibre, searchQuery, sourcePriceUsd, gl,
+  } = req.body || {};
 
   try {
     const sourceAttrs = attributes || {};
 
-    const affiliateQuery = buildQuery({
-      category,
-      fibre,
-      colorFamily: sourceAttrs.color_family,
-      silhouette:  sourceAttrs.silhouette,
-      lane:        'affiliate',
-      searchQuery,
-    });
-    const indieQuery = buildQuery({
-      category,
-      fibre,
-      colorFamily: sourceAttrs.color_family,
-      silhouette:  sourceAttrs.silhouette,
-      lane:        'indie',
-      searchQuery,
-    });
-
-    // Run both lanes. The affiliate lane is a narrower query (it'll naturally
-    // surface bigger retailers); the indie lane biases toward small labels.
     const [affiliateRaw, indieRaw] = await Promise.all([
-      runSearch(affiliateQuery),
-      runSearch(indieQuery),
+      shoppingSearch(buildQuery({ searchQuery, category, fibre, ...sourceAttrs, lane: 'affiliate' }), gl),
+      shoppingSearch(buildQuery({ searchQuery, category, fibre, ...sourceAttrs, lane: 'indie' }), gl),
     ]);
 
-    // Dedupe by URL across both lanes
-    const seen = new Set();
-    const candidates = [...affiliateRaw, ...indieRaw].filter(r => {
-      if (seen.has(r.url)) return false;
-      seen.add(r.url);
+    // Dedupe by merchant+title, since the same product appears in both lanes
+    const seenKeys = new Set();
+    const pool = [...affiliateRaw, ...indieRaw].filter(c => {
+      const k = `${c.merchant}|${c.title}`.toLowerCase();
+      if (seenKeys.has(k)) return false;
+      seenKeys.add(k);
       return true;
-    }).slice(0, 24);   // cap what we send to Claude, for cost and latency
-
-    // Diagnostics: these three numbers tell you exactly which stage is dropping
-    // candidates. Remove once the thresholds are tuned.
-    console.log('[search] queries:', { affiliateQuery, indieQuery });
-    console.log('[search] raw results:', {
-      affiliate: affiliateRaw.length,
-      indie:     indieRaw.length,
-      deduped:   candidates.length,
     });
 
-    if (candidates.length === 0) {
-      console.log('[search] no candidates survived domain filtering');
-      return res.status(200).json({ alternatives: [], source: 'search' });
-    }
+    console.log('[search] shopping pool:', pool.length);
 
-    const verified     = await verifyCandidates(imageUrl, sourceAttrs, candidates);
-    const alternatives = compose(verified, sourcePriceUsd);
+    // Resolve merchant URLs, capped
+    const toResolve = pool.slice(0, MAX_RESOLVE);
+    const resolved = (await Promise.all(
+      toResolve.map(async c => ({ ...c, url: await resolveMerchantUrl(c) }))
+    )).filter(c => c.url && !isExcluded(c.url));
 
-    console.log('[search] verification:', {
-      verified:      verified.length,
-      naturalFibre:  verified.filter(r => r.natural_fibre_likely).length,
-      productPages:  verified.filter(r => r.is_product_page).length,
-      passedVisual:  verified.filter(r => r.visual_match >= MIN_VISUAL_MATCH).length,
-      passedBoth:    verified.filter(r => r.natural_fibre_likely && r.visual_match >= MIN_VISUAL_MATCH).length,
-      shown:         alternatives.length,
-      scoreSample:   verified.slice(0, 5).map(r => ({
-        t: r.title?.slice(0, 40), nat: r.natural_fibre_likely, vis: r.visual_match,
-      })),
-    });
+    console.log('[search] resolved urls:', resolved.length, 'of', toResolve.length);
 
-    // Capture everything that passed the fibre and product-page checks into
-    // staging, not just what we're showing. A result can be a poor visual match
-    // for THIS shopper's item while still being a perfectly good catalogue product.
-    //
-    // MUST be awaited: on serverless, the function can be frozen or terminated
-    // the moment the response is sent, which kills any in-flight promise. A
-    // fire-and-forget write here silently never completes.
-    const worthCapturing = verified.filter(r => r.natural_fibre_likely && r.is_product_page);
-    await writeToStaging(worthCapturing, indieQuery).catch(err =>
-      console.error('[staging] write-back failed:', err.message)
+    // Skip anything already in staging — including past rejections, so a
+    // known-synthetic product never costs another fetch.
+    const seenUrls = await loadSeenUrls(resolved.map(c => c.url));
+    const fresh = resolved.filter(c => !seenUrls.has(c.url));
+
+    console.log('[search] fresh (not already staged):', fresh.length);
+
+    // Fetch + verify each
+    const verified = (await Promise.all(fresh.map(async c => {
+      const pageText = await fetchPageText(c.url);
+      if (!pageText) return null;
+      try {
+        const v = await verifyProduct({ sourceImageUrl: imageUrl, sourceAttrs, candidate: c, pageText });
+        return v ? { ...c, ...v } : null;
+      } catch (err) {
+        console.error('[verify] failed:', err.message);
+        return null;
+      }
+    }))).filter(Boolean);
+
+    // Split on actual composition read from the page — not a snippet guess
+    const naturals = verified.filter(v =>
+      v.is_product_page !== false &&
+      Object.keys(v.shell_fibres || {}).length > 0 &&
+      naturalShare(v.shell_fibres) >= MIN_NATURAL_SHARE
     );
+    const rejects = verified.filter(v => !naturals.includes(v));
+
+    console.log('[search] verified:', verified.length, 'natural:', naturals.length);
+
+    // Write both: naturals as promotion candidates, rejects as skip-list entries
+    await writeToStaging([
+      ...naturals.map(v => ({
+        name:               v.product_name || v.title,
+        url:                v.url,
+        image_url:          v.image,
+        brand:              v.brand_name || v.merchant,
+        source_domain:      domainOf(v.url),
+        source_query:       searchQuery || '',
+        fibre_composition:  v.shell_fibres,
+        shell_natural:      true,
+        price_original:     parsePriceValue(v.price, v.priceValue),
+        visual_match_score: v.visual_match,
+        fibre_confidence:   'likely',
+        review_status:      'pending',
+      })),
+      ...rejects.map(v => ({
+        name:               v.product_name || v.title,
+        url:                v.url,
+        source_domain:      domainOf(v.url),
+        source_query:       searchQuery || '',
+        fibre_composition:  v.shell_fibres || {},
+        shell_natural:      false,
+        fibre_confidence:   'rejected',
+        review_status:      'rejected',
+        rejection_reason:   Object.keys(v.shell_fibres || {}).length === 0
+          ? 'no composition found on page'
+          : 'shell not predominantly natural',
+      })),
+    ]);
+
+    // Only naturals that also match visually are shown to the shopper
+    const showable = naturals
+      .filter(v => (v.visual_match || 0) >= MIN_VISUAL_MATCH)
+      .sort((a, b) => (b.visual_match || 0) - (a.visual_match || 0));
+
+    const affiliatePick = showable.find(v => isAffiliateRetailer(v.url));
+    const ordered = affiliatePick
+      ? [affiliatePick, ...showable.filter(v => v !== affiliatePick)]
+      : showable;
+
+    const alternatives = ordered.slice(0, MAX_SHOWN).map(v => {
+      const value = parsePriceValue(v.price, v.priceValue);
+      return {
+        brand:       v.brand_name || v.merchant,
+        product:     v.product_name || v.title,
+        url:         v.url,
+        image:       v.image,
+        price:       v.price || '',
+        tier:        assignTier(value, sourcePriceUsd) || 'discovery',
+        material:    Object.entries(v.shell_fibres || {})
+                       .sort(([, a], [, b]) => b - a)
+                       .slice(0, 2)
+                       .map(([n, p]) => `${n} ${p}%`)
+                       .join(', '),
+        match_score: v.visual_match,
+        source:      'search',
+        verified:    true,   // composition read from the product page itself
+        affiliate:   isAffiliateRetailer(v.url),
+      };
+    });
+
+    console.log('[search] returning', alternatives.length, 'alternatives');
 
     return res.status(200).json({ alternatives, source: 'search' });
   } catch (err) {
