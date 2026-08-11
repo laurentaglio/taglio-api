@@ -368,7 +368,9 @@ function compose(verified) {
  * the shopper sees, so errors are logged and swallowed.
  */
 async function writeToStaging(results, sourceQuery) {
-  const base = process.env.VITE_SUPABASE_URL;
+  // Strip any trailing slash — a base ending in "/" produces "//rest/v1/..."
+  // which PostgREST rejects as an invalid path (PGRST125).
+  const base = (process.env.VITE_SUPABASE_URL || '').replace(/\/+$/, '');
   const key  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   console.log('[staging] called with', results.length, 'results; credentials present:',
@@ -398,8 +400,11 @@ async function writeToStaging(results, sourceQuery) {
   try {
     // on_conflict on url + merge-duplicates: rediscovering a product updates it
     // rather than erroring or duplicating. times_seen is bumped separately below.
+    const targetUrl = `${base}/rest/v1/products_staging?on_conflict=url`;
+    console.log('[staging] POST', targetUrl);
+
     const res = await fetch(
-      `${base}/rest/v1/products_staging?on_conflict=url`,
+      targetUrl,
       {
         method: 'POST',
         headers: {
