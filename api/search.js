@@ -263,6 +263,86 @@ function compose(verified) {
   return alternatives;
 }
 
+// ── Staging write-back ─────────────────────────────────────────────────────────
+
+/*
+ * Writes discovered products into products_staging so the catalogue grows from
+ * real usage rather than only from manual seeding.
+ *
+ * Uses the SERVICE ROLE key, not the anon key: products_staging has RLS enabled
+ * with no public policies, precisely because unverified rows must not be
+ * reachable from the client. Never expose SUPABASE_SERVICE_ROLE_KEY to the
+ * extension — it belongs only in this server-side function.
+ *
+ * Fire-and-forget by design: a staging write failing should never degrade what
+ * the shopper sees, so errors are logged and swallowed.
+ */
+async function writeToStaging(results, sourceQuery) {
+  const base = process.env.VITE_SUPABASE_URL;
+  const key  = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!base || !key) {
+    console.warn('staging write skipped: Supabase service credentials not configured');
+    return;
+  }
+  if (results.length === 0) return;
+
+  const rows = results.map(r => ({
+    name:               r.title,
+    url:                r.url,
+    image_url:          r.image,
+    brand:              r.source,
+    source_domain:      domainOf(r.url),
+    source_query:       sourceQuery,
+    visual_match_score: r.visual_match,
+    fibre_confidence:   r.natural_fibre_likely ? 'likely' : 'unconfirmed',
+    review_status:      'pending',
+  }));
+
+  try {
+    // on_conflict on url + merge-duplicates: rediscovering a product updates it
+    // rather than erroring or duplicating. times_seen is bumped separately below.
+    const res = await fetch(
+      `${base}/rest/v1/products_staging?on_conflict=url`,
+      {
+        method: 'POST',
+        headers: {
+          apikey:          key,
+          Authorization:   `Bearer ${key}`,
+          'Content-Type':  'application/json',
+          Prefer:          'resolution=merge-duplicates,return=minimal',
+        },
+        body: JSON.stringify(rows),
+      }
+    );
+
+    if (!res.ok) {
+      const body = await res.text();
+      console.error('staging write failed:', res.status, body.slice(0, 300));
+      return;
+    }
+
+    // Bump times_seen for any URL we've seen before. Done as a separate RPC-less
+    // update since PostgREST upsert can't express "increment on conflict".
+    await Promise.all(rows.map(row =>
+      fetch(
+        `${base}/rest/v1/rpc/increment_staging_seen`,
+        {
+          method: 'POST',
+          headers: {
+            apikey:         key,
+            Authorization:  `Bearer ${key}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ p_url: row.url }),
+        }
+      ).catch(() => {})   // best-effort; missing RPC shouldn't break anything
+    ));
+  } catch (err) {
+    console.error('staging write error:', err.message);
+  }
+}
+
 // ── Handler ────────────────────────────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
@@ -274,23 +354,26 @@ module.exports = async function handler(req, res) {
   try {
     const sourceAttrs = attributes || {};
 
+    const affiliateQuery = buildQuery({
+      category,
+      fibre,
+      colorFamily: sourceAttrs.color_family,
+      silhouette:  sourceAttrs.silhouette,
+      lane:        'affiliate',
+    });
+    const indieQuery = buildQuery({
+      category,
+      fibre,
+      colorFamily: sourceAttrs.color_family,
+      silhouette:  sourceAttrs.silhouette,
+      lane:        'indie',
+    });
+
     // Run both lanes. The affiliate lane is a narrower query (it'll naturally
     // surface bigger retailers); the indie lane biases toward small labels.
     const [affiliateRaw, indieRaw] = await Promise.all([
-      runSearch(buildQuery({
-        category,
-        fibre,
-        colorFamily: sourceAttrs.color_family,
-        silhouette:  sourceAttrs.silhouette,
-        lane:        'affiliate',
-      })),
-      runSearch(buildQuery({
-        category,
-        fibre,
-        colorFamily: sourceAttrs.color_family,
-        silhouette:  sourceAttrs.silhouette,
-        lane:        'indie',
-      })),
+      runSearch(affiliateQuery),
+      runSearch(indieQuery),
     ]);
 
     // Dedupe by URL across both lanes
@@ -307,6 +390,16 @@ module.exports = async function handler(req, res) {
 
     const verified     = await verifyCandidates(imageUrl, sourceAttrs, candidates);
     const alternatives = compose(verified);
+
+    // Capture everything that passed the fibre-plausibility check into staging,
+    // not just what we're showing. A result can be a poor visual match for THIS
+    // shopper's item while still being a perfectly good catalogue product.
+    // Deliberately not awaited — the shopper shouldn't wait on a write that
+    // doesn't affect their result.
+    const worthCapturing = verified.filter(r => r.natural_fibre_likely);
+    writeToStaging(worthCapturing, indieQuery).catch(err =>
+      console.error('staging write-back failed:', err.message)
+    );
 
     return res.status(200).json({ alternatives, source: 'search' });
   } catch (err) {
