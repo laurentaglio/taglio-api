@@ -371,11 +371,17 @@ async function writeToStaging(results, sourceQuery) {
   const base = process.env.VITE_SUPABASE_URL;
   const key  = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
+  console.log('[staging] called with', results.length, 'results; credentials present:',
+    { base: !!base, key: !!key });
+
   if (!base || !key) {
-    console.warn('staging write skipped: Supabase service credentials not configured');
+    console.warn('[staging] skipped: Supabase service credentials not configured');
     return;
   }
-  if (results.length === 0) return;
+  if (results.length === 0) {
+    console.log('[staging] nothing to write');
+    return;
+  }
 
   const rows = results.map(r => ({
     name:               r.title,
@@ -408,9 +414,11 @@ async function writeToStaging(results, sourceQuery) {
 
     if (!res.ok) {
       const body = await res.text();
-      console.error('staging write failed:', res.status, body.slice(0, 300));
+      console.error('[staging] write failed:', res.status, body.slice(0, 300));
       return;
     }
+
+    console.log('[staging] wrote', rows.length, 'rows, status', res.status);
 
     // Bump times_seen for any URL we've seen before. Done as a separate RPC-less
     // update since PostgREST upsert can't express "increment on conflict".
@@ -505,14 +513,16 @@ module.exports = async function handler(req, res) {
       })),
     });
 
-    // Capture everything that passed the fibre-plausibility check into staging,
-    // not just what we're showing. A result can be a poor visual match for THIS
-    // shopper's item while still being a perfectly good catalogue product.
-    // Deliberately not awaited — the shopper shouldn't wait on a write that
-    // doesn't affect their result.
+    // Capture everything that passed the fibre and product-page checks into
+    // staging, not just what we're showing. A result can be a poor visual match
+    // for THIS shopper's item while still being a perfectly good catalogue product.
+    //
+    // MUST be awaited: on serverless, the function can be frozen or terminated
+    // the moment the response is sent, which kills any in-flight promise. A
+    // fire-and-forget write here silently never completes.
     const worthCapturing = verified.filter(r => r.natural_fibre_likely && r.is_product_page);
-    writeToStaging(worthCapturing, indieQuery).catch(err =>
-      console.error('staging write-back failed:', err.message)
+    await writeToStaging(worthCapturing, indieQuery).catch(err =>
+      console.error('[staging] write-back failed:', err.message)
     );
 
     return res.status(200).json({ alternatives, source: 'search' });
